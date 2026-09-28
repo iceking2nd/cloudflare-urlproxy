@@ -156,6 +156,7 @@ describe("fetchFtp sessions", () => {
 				"331 pass\r\n",
 				"230 ok\r\n",
 				"200 type\r\n",
+				"250 CWD ok\r\n",
 				"229 entering (|||9998|)\r\n",
 				"150 opening\r\n",
 				"226 done\r\n",
@@ -169,7 +170,35 @@ describe("fetchFtp sessions", () => {
 		const html = await response.text();
 		expect(html).toContain("Index of ftp://files.example.com/pub/");
 		expect(html).toContain(`href="${PROXY_BASE}ftp://files.example.com/pub/hello%20world.txt"`);
-		expect(fakes.control.sent.map(stripCrlf)).toContain("NLST /pub/");
+		// 目录列表走 CWD + 裸 NLST (带路径参数的 NLST 在老式 ftpd 上返回 "路径/名字" 整行)
+		// directory listings go through CWD + bare NLST (with a path argument NLST returns whole "path/name" lines on older ftpds)
+		expect(fakes.control.sent.map(stripCrlf)).toContain("CWD /pub/");
+		expect(fakes.control.sent.map(stripCrlf)).toContain("NLST");
+	});
+
+	it("normalizes path-prefixed NLST entries to basenames", async () => {
+		// 兜底: 个别服务器即便裸 NLST 也返回带路径前缀的条目, 链接必须归一化为纯名, 否则点击后路径套娃
+		// fallback: some servers return path-prefixed entries even for bare NLST; links must be normalized to basenames or they nest on click
+		const fakes = installFtpFakes(
+			[
+				"220 ready\r\n",
+				"331 pass\r\n",
+				"230 ok\r\n",
+				"200 type\r\n",
+				"250 CWD ok\r\n",
+				"229 entering (|||9998|)\r\n",
+				"150 opening\r\n",
+				"226 done\r\n",
+				"221 bye\r\n",
+			],
+			[["portable\r\n", "/pub/OpenSSH//openssh-1.2.2.tgz\r\n"]],
+		);
+		const response = await fetchFtp(new URL("ftp://files.example.com/pub/"), () => {}, PROXY_BASE);
+		expect(response.status).toBe(200);
+		const html = await response.text();
+		expect(html).toContain(`href="${PROXY_BASE}ftp://files.example.com/pub/openssh-1.2.2.tgz"`);
+		expect(html).toContain("openssh-1.2.2.tgz</a>");
+		expect(html).not.toContain("%2F");
 	});
 
 	it("falls back to a directory listing when RETR reports 550", async () => {
@@ -181,6 +210,7 @@ describe("fetchFtp sessions", () => {
 				"200 type\r\n",
 				"229 entering (|||9998|)\r\n",
 				"550 no such file\r\n",
+				"250 CWD ok\r\n",
 				"229 entering (|||9997|)\r\n",
 				"150 opening\r\n",
 				"226 done\r\n",
@@ -191,10 +221,11 @@ describe("fetchFtp sessions", () => {
 		const response = await fetchFtp(new URL("ftp://files.example.com/pub"), () => {}, PROXY_BASE);
 		expect(response.status).toBe(200);
 		expect(await response.text()).toContain("Index of ftp://files.example.com/pub");
-		expect(fakes.control.sent.map(stripCrlf)).toContain("NLST /pub");
+		expect(fakes.control.sent.map(stripCrlf)).toContain("CWD /pub");
+		expect(fakes.control.sent.map(stripCrlf)).toContain("NLST");
 	});
 
-	it("returns 404 when neither RETR nor NLST succeeds", async () => {
+	it("returns 404 when neither RETR nor CWD succeeds", async () => {
 		installFtpFakes(
 			[
 				"220 ready\r\n",
@@ -203,13 +234,59 @@ describe("fetchFtp sessions", () => {
 				"200 type\r\n",
 				"229 entering (|||9998|)\r\n",
 				"550 no file\r\n",
-				"229 entering (|||9997|)\r\n",
 				"550 no dir\r\n",
 			],
-			[[], []],
+			[[]],
 		);
 		const response = await fetchFtp(new URL("ftp://files.example.com/missing"), () => {}, PROXY_BASE);
 		expect(response.status).toBe(404);
+	});
+
+	it("accepts a many-line ASCII-art login banner (planetunix-style)", async () => {
+		// 真实案例: mirror.planetunix.net 的 230 应答带 34 行 "230-" Puffy ASCII art 续行, 旧的 32 行数上限误判为响应过长
+		// real case: mirror.planetunix.net answers PASS with a 34-line "230-" Puffy ASCII-art banner; the old 32-line guard rejected it as oversized
+		const banner = Array.from({ length: 34 }, (_, i) => `230- banner line ${i + 1}\r\n`);
+		banner.push("230 Guest login ok, access restrictions apply.\r\n");
+		const fakes = installFtpFakes(
+			[
+				"220 mirror.example.net FTP server ready.\r\n",
+				"331 Guest login ok, send your email address as password.\r\n",
+				...banner,
+				"200 Type set to I.\r\n",
+				"250 CWD ok\r\n",
+				"229 Entering Extended Passive Mode (|||9999|)\r\n",
+				"150 opening data connection\r\n",
+				"226 transfer complete\r\n",
+				"221 bye\r\n",
+			],
+			[["openssh.txt\r\n"]],
+		);
+		const response = await fetchFtp(new URL("ftp://mirror.example.net/pub/"), () => {}, PROXY_BASE);
+		expect(response.status).toBe(200);
+		const html = await response.text();
+		expect(html).toContain("Index of ftp://mirror.example.net/pub/");
+		expect(html).toContain("openssh.txt");
+		expect(fakes.control.sent.map(stripCrlf)).toContain("CWD /pub/");
+		expect(fakes.control.sent.map(stripCrlf)).toContain("NLST");
+	});
+
+	it("still rejects a multi-line response past the size cap", async () => {
+		// 防御仍在: 聚合超过上限仍未终结的多行响应必须拒绝, 防止异常服务器无限读取
+		// the guard stays: an unterminated multi-line response past the size cap is rejected so a misbehaving server cannot force unbounded reads
+		const filler = `230-${"x".repeat(96)}\r\n`; // ~35 字节/行 × 2000 行 ≈ 70 KiB / ~35 bytes per line × 2000 lines ≈ 70 KiB
+		installFtpFakes(["220 ready\r\n", "331 pass\r\n", ...Array.from({ length: 2000 }, () => filler)]);
+		const response = await fetchFtp(new URL("ftp://files.example.com/"), () => {}, PROXY_BASE);
+		expect(response.status).toBe(502);
+		expect(await response.text()).toBe("FTP response too long");
+	});
+
+	it("still rejects a single line past the line-size cap", async () => {
+		// 单行防御: 无换行的超长行不能把行缓冲无限撑大
+		// single-line guard: an unterminated oversized line must not balloon the line buffer unboundedly
+		installFtpFakes(["220 ready\r\n", "331 pass\r\n", `230-${"x".repeat(9 * 1024)}`]);
+		const response = await fetchFtp(new URL("ftp://files.example.com/"), () => {}, PROXY_BASE);
+		expect(response.status).toBe(502);
+		expect(await response.text()).toBe("FTP response line too long");
 	});
 
 	it("returns 403 when FTP login fails", async () => {

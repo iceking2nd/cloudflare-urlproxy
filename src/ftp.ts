@@ -219,6 +219,11 @@ ${links.join("\n")}
 // 会话实现 / Session implementation
 // ---------------------------------------------------------------------------
 
+/** 聚合响应的累计长度上限 (字符数, 含 CRLF), 拦截异常服务器的无限读取 / total-size cap on an aggregated response (chars, CRLF included); stops unbounded reads from a misbehaving server */
+const MAX_RESPONSE_CHARS = 64 * 1024;
+/** 单行长度上限 (字符数): 无换行的超长流不得无限撑大行缓冲 / per-line cap (chars): an unterminated oversized stream must not balloon the line buffer */
+const MAX_LINE_CHARS = 8 * 1024;
+
 /** 流式按行读取: 处理 chunk 半行/多行边界与多字节 UTF-8 边界 / Streaming line reader: handles chunk boundaries (partial/multiple lines) and multi-byte UTF-8 boundaries */
 class FtpLineReader {
 	private buffer = "";
@@ -245,6 +250,8 @@ class FtpLineReader {
 				continue;
 			}
 			this.buffer += this.decoder.decode(value, { stream: true });
+			// 换行迟迟不出现而行已超限: 拒绝而不是继续累积 / the line is past the cap with no newline in sight: reject instead of buffering on
+			if (this.buffer.length > MAX_LINE_CHARS) throw new FtpError(502, "FTP response line too long");
 		}
 	}
 }
@@ -258,15 +265,18 @@ async function readFtpResponse(lineReader: FtpLineReader): Promise<FtpResponse> 
 	}
 	if (parsed.isFinal) return { code: parsed.code, text: first };
 	const lines = [first];
-	// 行数上限防御: 异常服务器不应导致无限读取 / line-count guard: a misbehaving server must not cause unbounded reads
-	for (let i = 0; i < 32; i++) {
+	let totalChars = first.length + 2;
+	for (;;) {
 		const line = await lineReader.readLine();
 		if (line === "") throw new FtpError(502, "FTP connection closed mid-response");
+		totalChars += line.length + 2;
+		// 聚合长度上限防御: 行数无限制 (真实横幅可带几十行 ASCII art), 但累计超限仍未终结即拒绝
+		// total-size guard: no line-count limit (real banners carry dozens of ASCII-art lines), but an unterminated response past the cap is rejected
+		if (totalChars > MAX_RESPONSE_CHARS) throw new FtpError(502, "FTP response too long");
 		lines.push(line);
 		const p = parseFtpResponseLine(line);
 		if (p && p.isFinal && p.code === parsed.code) return { code: parsed.code, text: lines.join("\n") };
 	}
-	throw new FtpError(502, "FTP response too long");
 }
 
 function ftpCommand(session: FtpSession, cmd: string): Promise<FtpResponse> {
@@ -368,8 +378,14 @@ async function finalizeTransfer(session: FtpSession): Promise<void> {
 async function listDirectory(session: FtpSession, dstUrl: URL, proxyBase: string): Promise<Response> {
 	const func = "src.ftp.listDirectory";
 	const path = dstUrl.pathname || "/";
+	// 先 CWD 进目录再发裸 NLST: 带路径参数的 NLST 在老式 ftpd 上会整行返回 "路径/名字", 裸 NLST 才返回纯名 (与 curl 等客户端一致)
+	// CWD into the directory first, then a bare NLST: with a path argument older ftpds answer with whole "path/name" lines; only a bare NLST returns plain names (mirroring curl et al.)
+	const cwdResp = await session.command(`CWD ${sanitizeFtpArg(path)}`);
+	if (cwdResp.code !== 250) {
+		throw new FtpError(cwdResp.code === 550 ? 404 : 502, `FTP CWD failed (code ${cwdResp.code})`, cwdResp.code);
+	}
 	const dataSocket = await openPassiveData(session);
-	const resp = await session.command(`NLST ${sanitizeFtpArg(path)}`);
+	const resp = await session.command("NLST");
 	if (resp.code !== 150 && resp.code !== 125) {
 		dataSocket.close();
 		throw new FtpError(resp.code === 550 ? 404 : 502, `FTP NLST failed (code ${resp.code})`, resp.code);
@@ -383,7 +399,12 @@ async function listDirectory(session: FtpSession, dstUrl: URL, proxyBase: string
 		// 服务器可能直接断开, 忽略 / the server may drop the connection directly, ignore
 	}
 	session.close();
-	const names = listing.split(/\r?\n/).filter((n) => n !== "");
+	// 兜底: 个别服务器即便裸 NLST 仍返回带路径前缀的条目, 取末段归一化, 防止链接套娃
+	// fallback: some servers return path-prefixed entries even for a bare NLST; take the last segment so links do not nest
+	const names = listing
+		.split(/\r?\n/)
+		.map((n) => n.split("/").pop() ?? n)
+		.filter((n) => n !== "");
 	console.debug("directory listed", { func, path, count: names.length });
 	return new Response(renderDirectoryListing(dstUrl, proxyBase, names), {
 		status: 200,

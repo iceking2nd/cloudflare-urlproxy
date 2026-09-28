@@ -183,6 +183,7 @@ describe("urlproxy worker", () => {
 				"331 pass\r\n",
 				"230 ok\r\n",
 				"200 type\r\n",
+				"250 CWD ok\r\n",
 				"229 (|||9998|)\r\n",
 				"150 opening\r\n",
 				"226 done\r\n",
