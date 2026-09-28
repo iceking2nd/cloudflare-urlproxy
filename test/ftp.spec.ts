@@ -80,6 +80,14 @@ describe("ftp helpers", () => {
 		const html = renderDirectoryListing(new URL("ftp://alice:p%40ss@h.example/pub/"), PROXY_BASE, ["x"]);
 		expect(html).toContain("ftp://alice:p%40ss@h.example/pub/x");
 	});
+
+	it("appends the token query suffix to every listing link when provided", () => {
+		// index.ts 构造的 suffix 已 encodeURIComponent, 这里直接拼接 / the suffix is built (already encodeURIComponent'd) by index.ts; concatenated as-is here
+		const html = renderDirectoryListing(new URL("ftp://h.example/pub/"), PROXY_BASE, ["file.txt"], "?__proxy_token=t%20x");
+		expect(html).toContain(`href="${PROXY_BASE}ftp://h.example/pub/file.txt?__proxy_token=t%20x"`);
+		// 父目录链接同样携带 / the parent link carries it too
+		expect(html).toContain(`href="${PROXY_BASE}ftp://h.example/?__proxy_token=t%20x"`);
+	});
 });
 
 describe("fetchFtp sessions", () => {
@@ -293,6 +301,26 @@ describe("fetchFtp sessions", () => {
 		installFtpFakes(["220 ready\r\n", "331 password required\r\n", "530 login failed\r\n"]);
 		const response = await fetchFtp(new URL("ftp://alice:badpass@files.example.com/"), () => {}, PROXY_BASE);
 		expect(response.status).toBe(403);
+	});
+
+	it("passes the token query suffix through to the rendered listing", async () => {
+		installFtpFakes(
+			[
+				"220 ready\r\n",
+				"331 pass\r\n",
+				"230 ok\r\n",
+				"200 type\r\n",
+				"250 CWD ok\r\n",
+				"229 entering (|||9999|)\r\n",
+				"150 opening\r\n",
+				"226 done\r\n",
+				"221 bye\r\n",
+			],
+			[["sub\r\n"]],
+		);
+		const response = await fetchFtp(new URL("ftp://files.example.com/pub/"), () => {}, PROXY_BASE, "?__proxy_token=t");
+		const html = await response.text();
+		expect(html).toContain("ftp://files.example.com/pub/sub?__proxy_token=t");
 	});
 
 	it("returns 502 when the control connection cannot be established", async () => {

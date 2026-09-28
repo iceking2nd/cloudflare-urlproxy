@@ -185,8 +185,17 @@ function parentOf(path: string): string {
 	return idx <= 0 ? "/" : `${trimmed.slice(0, idx)}/`;
 }
 
-/** 生成目录导航页: 名字做 HTML 转义, 链接经代理并保留 URL 中已有的编码凭据 / Render the directory navigation page: names are HTML-escaped, links go through the proxy and keep the URL's encoded credentials */
-export function renderDirectoryListing(dstUrl: URL, proxyBase: string, names: string[]): string {
+/**
+ * 生成目录导航页: 名字做 HTML 转义, 链接经代理并保留 URL 中已有的编码凭据。
+ * tokenQuerySuffix 由 index.ts 在 token 来自 ?__proxy_token= 时构造 (值已 encodeURIComponent), 追加到每个链接
+ * 尾部, 让点击导航继续带上 token; header 用户的页面不落 token。
+ *
+ * Render the directory navigation page: names are HTML-escaped, links go through the proxy and keep the
+ * URL's encoded credentials. tokenQuerySuffix is built by index.ts when the token came via ?__proxy_token=
+ * (value already encodeURIComponent'd) and is appended to every link so clicked navigations keep carrying
+ * the token; header users' pages carry no token.
+ */
+export function renderDirectoryListing(dstUrl: URL, proxyBase: string, names: string[], tokenQuerySuffix = ""): string {
 	const func = "src.ftp.renderDirectoryListing";
 	console.debug("rendering directory listing", { func, count: names.length });
 	// 链接保留编码凭据以便带凭据继续浏览 (用户自己 URL 中提供的值, 转义防注入)
@@ -195,12 +204,12 @@ export function renderDirectoryListing(dstUrl: URL, proxyBase: string, names: st
 	const listingUrl = `ftp://${dstUrl.host}${dstUrl.pathname}`;
 	const links: string[] = [];
 	if (dstUrl.pathname !== "/" && dstUrl.pathname !== "") {
-		const parentHref = `${proxyBase}ftp://${credentials}${dstUrl.host}${parentOf(dstUrl.pathname)}`;
+		const parentHref = `${proxyBase}ftp://${credentials}${dstUrl.host}${parentOf(dstUrl.pathname)}${tokenQuerySuffix}`;
 		links.push(`<li><a href="${escapeHtml(parentHref)}">..</a></li>`);
 	}
 	for (const name of names) {
 		if (name === "") continue;
-		const href = `${proxyBase}ftp://${credentials}${dstUrl.host}${joinFtpPath(dstUrl.pathname, encodeURIComponent(name))}`;
+		const href = `${proxyBase}ftp://${credentials}${dstUrl.host}${joinFtpPath(dstUrl.pathname, encodeURIComponent(name))}${tokenQuerySuffix}`;
 		links.push(`<li><a href="${escapeHtml(href)}">${escapeHtml(name)}</a></li>`);
 	}
 	return `<!doctype html>
@@ -375,7 +384,7 @@ async function finalizeTransfer(session: FtpSession): Promise<void> {
 }
 
 /** 获取目录列表并生成 HTML 导航页 (同步收尾, 不依赖 waitUntil) / Fetch the directory listing and render the HTML navigation page (finalizes synchronously, no waitUntil needed) */
-async function listDirectory(session: FtpSession, dstUrl: URL, proxyBase: string): Promise<Response> {
+async function listDirectory(session: FtpSession, dstUrl: URL, proxyBase: string, tokenQuerySuffix: string): Promise<Response> {
 	const func = "src.ftp.listDirectory";
 	const path = dstUrl.pathname || "/";
 	// 先 CWD 进目录再发裸 NLST: 带路径参数的 NLST 在老式 ftpd 上会整行返回 "路径/名字", 裸 NLST 才返回纯名 (与 curl 等客户端一致)
@@ -406,7 +415,7 @@ async function listDirectory(session: FtpSession, dstUrl: URL, proxyBase: string
 		.map((n) => n.split("/").pop() ?? n)
 		.filter((n) => n !== "");
 	console.debug("directory listed", { func, path, count: names.length });
-	return new Response(renderDirectoryListing(dstUrl, proxyBase, names), {
+	return new Response(renderDirectoryListing(dstUrl, proxyBase, names, tokenQuerySuffix), {
 		status: 200,
 		statusText: "OK",
 		headers: { "content-type": "text/html; charset=utf-8" },
@@ -419,6 +428,7 @@ async function retrieveFile(
 	dstUrl: URL,
 	proxyBase: string,
 	waitUntil: (p: Promise<unknown>) => void,
+	tokenQuerySuffix: string,
 ): Promise<Response> {
 	const func = "src.ftp.retrieveFile";
 	const path = dstUrl.pathname || "/";
@@ -427,7 +437,7 @@ async function retrieveFile(
 	if (resp.code === 550) {
 		console.debug("RETR reported 550, falling back to directory listing", { func, path });
 		dataSocket.close();
-		return listDirectory(session, dstUrl, proxyBase);
+		return listDirectory(session, dstUrl, proxyBase, tokenQuerySuffix);
 	}
 	if (resp.code !== 150 && resp.code !== 125) {
 		dataSocket.close();
@@ -460,15 +470,19 @@ function toFtpErrorResponse(e: unknown): Response {
 
 /**
  * FTP 入口: 按 URL 取文件或目录列表, 返回可直接交给客户端的 Response。
- * waitUntil 用于承接 RETR 流式响应后的控制连接收尾; proxyBase 用于目录页链接生成。
+ * waitUntil 用于承接 RETR 流式响应后的控制连接收尾; proxyBase 用于目录页链接生成;
+ * tokenQuerySuffix 由 index.ts 在 token 来自 ?__proxy_token= 时构造, 随目录页链接传播。
  *
  * FTP entry point: fetches a file or directory listing by URL and returns a client-ready Response.
- * waitUntil carries the control-connection finalization for streamed RETR responses; proxyBase is used for directory-page links.
+ * waitUntil carries the control-connection finalization for streamed RETR responses; proxyBase is used for
+ * directory-page links; tokenQuerySuffix is built by index.ts when the token came via ?__proxy_token=
+ * and propagates through the directory-page links.
  */
 export async function fetchFtp(
 	dstUrl: URL,
 	waitUntil: (p: Promise<unknown>) => void,
 	proxyBase: string,
+	tokenQuerySuffix = "",
 ): Promise<Response> {
 	const func = "src.ftp.fetchFtp";
 	const hostname = dstUrl.hostname;
@@ -480,11 +494,11 @@ export async function fetchFtp(
 		session = await openControlSession(hostname, port, ftpCredentials(dstUrl));
 		const path = dstUrl.pathname || "/";
 		if (path.endsWith("/")) {
-			const response = await listDirectory(session, dstUrl, proxyBase);
+			const response = await listDirectory(session, dstUrl, proxyBase, tokenQuerySuffix);
 			session = null; // 所有权已移交给 listDirectory (其内部已收尾) / ownership transferred to listDirectory (it finalizes internally)
 			return response;
 		}
-		const response = await retrieveFile(session, dstUrl, proxyBase, waitUntil);
+		const response = await retrieveFile(session, dstUrl, proxyBase, waitUntil, tokenQuerySuffix);
 		session = null; // 控制连接由 waitUntil 的 finalizeTransfer 负责 / the control connection is finalizeTransfer's responsibility in waitUntil
 		return response;
 	} catch (e) {
