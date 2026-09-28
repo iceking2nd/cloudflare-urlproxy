@@ -202,6 +202,54 @@ describe("urlproxy worker", () => {
 		expect(response.headers.get("cache-control")).toBe("no-store");
 	});
 
+	it("propagates a query-provided token into FTP directory page links", async () => {
+		// 场景: 经 ?__proxy_token= 打开目录页后点击导航, 链接若不带 token 会 403; query token 必须传播进页内所有链接
+		// scenario: after opening a directory page via ?__proxy_token=, clicking a link without the token 403s; the query token must propagate into every page link
+		installFtpFakes(
+			[
+				"220 ready\r\n",
+				"331 pass\r\n",
+				"230 ok\r\n",
+				"200 type\r\n",
+				"250 CWD ok\r\n",
+				"229 (|||9998|)\r\n",
+				"150 opening\r\n",
+				"226 done\r\n",
+				"221 bye\r\n",
+			],
+			[["sub\r\n", "file.txt\r\n"]],
+		);
+		const response = await callProxy(`${PROXY_ORIGIN}/ftp://files.example.com/pub/?__proxy_token=${encodeURIComponent(TOKEN)}`);
+		expect(response.status).toBe(200);
+		const html = await response.text();
+		expect(html).toContain(`ftp://files.example.com/pub/file.txt?__proxy_token=${encodeURIComponent(TOKEN)}`);
+		// 父目录链接同样携带 / the parent link carries it too
+		expect(html).toContain(`href="${PROXY_ORIGIN}/ftp://files.example.com/?__proxy_token=${encodeURIComponent(TOKEN)}`);
+	});
+
+	it("keeps FTP directory page links token-free when the token came from the header", async () => {
+		// header token: 页面不落 token, 暴露面不扩大 / header token: the page carries no token, so the exposure surface does not grow
+		installFtpFakes(
+			[
+				"220 ready\r\n",
+				"331 pass\r\n",
+				"230 ok\r\n",
+				"200 type\r\n",
+				"250 CWD ok\r\n",
+				"229 (|||9998|)\r\n",
+				"150 opening\r\n",
+				"226 done\r\n",
+				"221 bye\r\n",
+			],
+			[["sub\r\n"]],
+		);
+		const response = await callProxy(`${PROXY_ORIGIN}/ftp://files.example.com/pub/`, {
+			headers: { "x-proxy-token": TOKEN },
+		});
+		expect(response.status).toBe(200);
+		expect(await response.text()).not.toContain("__proxy_token");
+	});
+
 	it("returns 400 for proxy loop destinations (destination host equals proxy host)", async () => {
 		const response = await callProxy(`${PROXY_ORIGIN}/https://proxy.example.com/anything`, {
 			headers: { "x-proxy-token": TOKEN },
@@ -254,6 +302,43 @@ describe("urlproxy worker", () => {
 		// 过期的 content-encoding / content-length 不得残留在重写后的响应里 / stale content-encoding / content-length must not survive into the rewritten response
 		expect(response.headers.get("content-encoding")).toBeNull();
 		expect(response.headers.get("content-length")).toBeNull();
+	});
+
+	it("propagates a query-provided token into every rewritten HTML URL", async () => {
+		// 场景: query token 打开的页面, 其内嵌子资源与链接经改写后必须继续携带 token, 否则点击/加载全部 403
+		// scenario: a page opened with a query token must keep carrying it in rewritten subresource and link URLs, or every click/load 403s
+		backendHandler = () =>
+			new Response(
+				'src="https://cdn.example.com/a.js" href="/x" data-u="//proto.example.com/y" href2="https://example.com/p?q=1" href3="https://example.com/anchor#top"',
+				{ headers: { "content-type": "text/html" } },
+			);
+		const response = await callProxy(`${PROXY_ORIGIN}/https://example.com/page?__proxy_token=${encodeURIComponent(TOKEN)}`);
+		expect(response.status).toBe(200);
+		const html = await response.text();
+		const tk = encodeURIComponent(TOKEN);
+		// 规则 1 (绝对 URL) / rule 1 (absolute URL)
+		expect(html).toContain(`src="https://proxy.example.com/https://cdn.example.com/a.js?__proxy_token=${tk}"`);
+		// 规则 2 (引号内绝对路径) / rule 2 (quoted absolute path)
+		expect(html).toContain(`href="https://proxy.example.com/https://example.com/x?__proxy_token=${tk}"`);
+		// 规则 3 (协议相对) / rule 3 (protocol-relative)
+		expect(html).toContain(`data-u="https://proxy.example.com/https://proto.example.com/y?__proxy_token=${tk}"`);
+		// 已有 query 用 & 合并 / merge with an existing query via &
+		expect(html).toContain(`href2="https://proxy.example.com/https://example.com/p?q=1&__proxy_token=${tk}"`);
+		// fragment 之前插入 (落入 fragment 的 token 会失效) / insert before the fragment (a token inside the fragment dies)
+		expect(html).toContain(`href3="https://proxy.example.com/https://example.com/anchor?__proxy_token=${tk}#top"`);
+	});
+
+	it("keeps JSON bodies token-free even with a query-provided token", async () => {
+		// 仅 html 注入: JSON/JS/纯文本的 URL 字段不携带 token, 防止凭证进入 API 数据流向下游
+		// html-only injection: URL fields in JSON/JS/plain text stay token-free so credentials never flow into downstream API data
+		backendHandler = () =>
+			new Response('{"url":"https://example.com/x"}', { headers: { "content-type": "application/json" } });
+		const response = await callProxy(`${PROXY_ORIGIN}/https://example.com/api?__proxy_token=${encodeURIComponent(TOKEN)}`);
+		expect(response.status).toBe(200);
+		const body = await response.text();
+		// URL 仍被改写 (现状行为), 但不带 token / the URL is still rewritten (existing behavior), without a token
+		expect(body).toContain(`{"url":"https://proxy.example.com/https://example.com/x"}`);
+		expect(body).not.toContain("__proxy_token");
 	});
 
 	it("keeps content-encoding for pass-through (non-text) responses", async () => {

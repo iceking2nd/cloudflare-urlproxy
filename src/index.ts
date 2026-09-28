@@ -44,6 +44,15 @@ export default {
 			return new Response(null, { status: 204, statusText: "No content" });
 		}
 
+		// query token 需传播进 worker 生成的链接 (FTP 目录页) 与改写后的 HTML URL (点击/子资源加载没有 header 可带);
+		// 仅当 token 确实来自 query 时构造, header 用户的页面不落 token。必须在 parseDestinationUrl 剥离 __proxy_token 之前捕获。
+		// a query token must propagate into worker-generated links (FTP directory pages) and rewritten HTML URLs (clicks and
+		// subresource loads carry no header); built only when the token really came from the query, so header users' pages carry
+		// no token. Capture before parseDestinationUrl strips it.
+		const headerToken = request.headers.get(PROXY_TOKEN_HEADER);
+		const queryToken = headerToken === null ? url.searchParams.get(PROXY_TOKEN_QUERY) : null;
+		const queryTokenSuffix = queryToken !== null ? `?${PROXY_TOKEN_QUERY}=${encodeURIComponent(queryToken)}` : "";
+
 		const authError = checkProxyToken(request, env, url);
 		if (authError) return authError;
 
@@ -59,7 +68,7 @@ export default {
 		if (dstUrl.protocol === "ftp:") {
 			// fetch() 不支持 FTP, 分派到基于 cloudflare:sockets 的 FTP 客户端 / fetch() does not support FTP; dispatch to the cloudflare:sockets based FTP client
 			console.debug("routing to FTP client", { func, dstUrlStr: loggableDst });
-			const ftpResponse = await fetchFtp(dstUrl, (p) => ctx.waitUntil(p), `${url.protocol}//${url.host}/`);
+			const ftpResponse = await fetchFtp(dstUrl, (p) => ctx.waitUntil(p), `${url.protocol}//${url.host}/`, queryTokenSuffix);
 			const headers = buildResponseHeaders(request, env, url, ftpResponse);
 			return new Response(ftpResponse.body, {
 				status: ftpResponse.status,
@@ -113,7 +122,9 @@ export default {
 		// 以重定向后的最终地址为基准 (redirect: "follow" 时预解析 host 可能已失效)
 		// base URL rewriting on the post-redirect final address (the pre-parsed host may be stale under redirect: "follow")
 		const finalUrl = new URL(backendResponse.url || dstUrlStr);
-		const body = rewriteTextBody(await backendResponse.text(), url, finalUrl);
+		// 仅 html 注入 token: 浏览器场景需要; JSON/JS/纯文本的 URL 字段不注, 防止凭证进入 API 数据流向下游
+		// inject the token into html only: the browser case needs it; URL fields in JSON/JS/plain text stay clean so credentials never flow into downstream API data
+		const body = rewriteTextBody(await backendResponse.text(), url, finalUrl, contentType.includes("html") ? queryTokenSuffix : "");
 		console.debug("text body rewritten", { func, finalHost: finalUrl.host });
 		return new Response(body, {
 			status: backendResponse.status,
@@ -259,17 +270,42 @@ function buildCsp(proxyHost: string): string {
 	].join("; ");
 }
 
-/** 改写文本响应中的 URL, 让页面内链接继续经由代理 / Rewrite URLs in text responses so in-page links keep going through the proxy */
-function rewriteTextBody(body: string, proxyUrl: URL, finalUrl: URL): string {
+/**
+ * 改写文本响应中的 URL, 让页面内链接继续经由代理; tokenQuerySuffix (仅 text/html 时由调用方传入) 追加到每个改写 URL,
+ * 让 query token 用户的点击导航与子资源加载继续携带 token。
+ *
+ * Rewrite URLs in text responses so in-page links keep going through the proxy; tokenQuerySuffix (passed by the
+ * caller for text/html only) is appended to every rewritten URL so query-token users' clicks and subresource
+ * loads keep carrying the token.
+ */
+function rewriteTextBody(body: string, proxyUrl: URL, finalUrl: URL, tokenQuerySuffix = ""): string {
 	const func = "src.index.rewriteTextBody";
 	const proxyBase = `${proxyUrl.protocol}//${proxyUrl.host}`;
+	// token 参数对 (剥去前导 ?), 由 appendToken 按目标是否已有 query 决定 ? 或 & 接入
+	// the token param (leading ? stripped); appendToken decides ? or & per whether the target already has a query
+	const tokenParam = tokenQuerySuffix.slice(1);
+	const appendToken = (urlStr: string): string => {
+		if (tokenParam === "") return urlStr;
+		// fragment 之后的 token 会落入 fragment 失效, 必须插到 fragment 之前
+		// a token placed after the fragment dies inside it; insert before the fragment
+		const hashIdx = urlStr.indexOf("#");
+		const head = hashIdx >= 0 ? urlStr.slice(0, hashIdx) : urlStr;
+		const frag = hashIdx >= 0 ? urlStr.slice(hashIdx) : "";
+		return head + (head.includes("?") ? "&" : "?") + tokenParam + frag;
+	};
 	let text = body;
-	// 1. 绝对 http(s) 地址 -> 经代理 / absolute http(s) URLs -> through the proxy
-	text = text.replaceAll(/(https?:\/\/)/gi, `${proxyBase}/$1`);
+	// 1. 绝对 http(s) 地址 -> 经代理; 捕获完整 URL (吞入的尾随标点吐回原文), token 才有明确的追加位置
+	//    absolute http(s) URLs -> through the proxy; capture the full URL (trailing punctuation swallowed by the
+	//    capture is handed back) so the token has a definite place to append
+	text = text.replaceAll(/(https?:\/\/[^\s"'<>]+)/gi, (m) => {
+		const url = m.replace(/[.,;:!?)\]]+$/, "");
+		const trailing = m.slice(url.length);
+		return `${proxyBase}/${appendToken(url)}${trailing}`;
+	});
 	// 2. 引号内绝对路径 "/path" -> 经代理指向重定向后的最终主机 / quoted absolute paths "/path" -> proxied, pointing at the post-redirect final host
-	text = text.replaceAll(/(["'])\/(\w\S*)(["'])/gi, `$1${proxyBase}/${finalUrl.protocol}//${finalUrl.host}/$2$3`);
+	text = text.replaceAll(/(["'])\/(\w\S*)(["'])/gi, (_m, q1: string, path: string, q2: string) => `${q1}${proxyBase}/${finalUrl.protocol}//${finalUrl.host}/${appendToken(path)}${q2}`);
 	// 3. 协议相对地址 "//host/path" -> 经代理指向展开后的绝对地址 / protocol-relative "//host/path" -> proxied, expanded into an absolute address
-	text = text.replaceAll(/(["'])\/\/(\S*)(["'])/gi, `$1${proxyBase}/${finalUrl.protocol}//$2$3`);
+	text = text.replaceAll(/(["'])\/\/(\S*)(["'])/gi, (_m, q1: string, rest: string, q2: string) => `${q1}${proxyBase}/${finalUrl.protocol}//${appendToken(rest)}${q2}`);
 	// 注意: 正则改写会波及 JSON/JS 字符串值 (如 API 返回的 url 字段), 属于该方案的固有局限
 	// note: regex rewriting also hits JSON/JS string values (e.g. url fields in API payloads); an inherent limitation of this approach
 	console.debug("text rewritten", { func, finalHost: finalUrl.host });
